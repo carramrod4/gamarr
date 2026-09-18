@@ -92,8 +92,15 @@ type Config struct {
 	TransmissionUser string
 	TransmissionPass string
 
-	// RAWG.io metadata
-	RAWGAPIKey string
+	// Metadata providers. IGDB is primary (Twitch client-credentials OAuth),
+	// RAWG is the fallback, and Steam needs no credentials at all.
+	RAWGAPIKey       string
+	IGDBClientID     string
+	IGDBClientSecret string
+
+	// MetadataCacheTTLMinutes bounds how long a cached provider response is
+	// reused. 0 falls back to the resolver default; negative disables caching.
+	MetadataCacheTTLMinutes int
 
 	// FlareSolverr is optional and is used to retrieve browser-rendered Vimm
 	// vault pages when the ordinary request receives its Turnstile gate.
@@ -230,7 +237,10 @@ func Load() *Config {
 		TransmissionUser: envStr("TRANSMISSION_USER", ""),
 		TransmissionPass: envStr("TRANSMISSION_PASS", ""),
 
-		RAWGAPIKey: envStr("RAWG_API_KEY", ""),
+		RAWGAPIKey:              envStr("RAWG_API_KEY", ""),
+		IGDBClientID:            envStr("IGDB_CLIENT_ID", ""),
+		IGDBClientSecret:        envStr("IGDB_CLIENT_SECRET", ""),
+		MetadataCacheTTLMinutes: envInt("METADATA_CACHE_TTL_MINUTES", 1440),
 
 		FlareSolverrURL:            envStr("FLARESOLVERR_URL", ""),
 		FlareSolverrMaxTimeout:     envFlareSolverrMaxTimeout(),
@@ -320,6 +330,17 @@ func (c *Config) HasDeluge() bool {
 
 func (c *Config) HasRAWG() bool {
 	return c.RAWGAPIKey != ""
+}
+
+func (c *Config) HasIGDB() bool {
+	return c.IGDBClientID != "" && c.IGDBClientSecret != ""
+}
+
+// HasMetadata reports whether any metadata provider can serve requests. Steam
+// needs no credentials, so this is always true - the metadata routes stay
+// available even with neither IGDB nor RAWG configured, just PC-only.
+func (c *Config) HasMetadata() bool {
+	return true
 }
 
 func (c *Config) HasOIDC() bool {

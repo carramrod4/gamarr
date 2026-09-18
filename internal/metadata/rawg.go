@@ -72,6 +72,14 @@ func (c *Client) Enabled() bool {
 // SearchGame searches RAWG for a game by query and optional platform slug.
 // Returns the best match or nil if nothing found.
 func (c *Client) SearchGame(query, platformSlug string) (*GameMetadata, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return c.searchGameCtx(ctx, query, platformSlug)
+}
+
+// searchGameCtx is SearchGame with a caller-supplied context, so the resolver
+// can cancel a RAWG lookup that is no longer needed.
+func (c *Client) searchGameCtx(ctx context.Context, query, platformSlug string) (*GameMetadata, error) {
 	if !c.Enabled() {
 		return nil, nil
 	}
@@ -85,9 +93,6 @@ func (c *Client) SearchGame(query, platformSlug string) (*GameMetadata, error) {
 		return entry.data, nil
 	}
 	c.mu.RUnlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 
 	c.rateLimit()
 
@@ -143,6 +148,13 @@ func (c *Client) SearchGame(query, platformSlug string) (*GameMetadata, error) {
 
 // GetGame fetches full game details by RAWG ID.
 func (c *Client) GetGame(id int) (*GameMetadata, error) {
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	return c.getGameCtx(ctx, id)
+}
+
+// getGameCtx is GetGame with a caller-supplied context.
+func (c *Client) getGameCtx(ctx context.Context, id int) (*GameMetadata, error) {
 	if !c.Enabled() {
 		return nil, nil
 	}
@@ -156,9 +168,6 @@ func (c *Client) GetGame(id int) (*GameMetadata, error) {
 		return entry.data, nil
 	}
 	c.mu.RUnlock()
-
-	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
-	defer cancel()
 
 	c.rateLimit()
 

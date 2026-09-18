@@ -21,6 +21,7 @@ import (
 	"gamarr/internal/config"
 	"gamarr/internal/download"
 	"gamarr/internal/fileops"
+	"gamarr/internal/metadata"
 	"gamarr/internal/models"
 	"gamarr/internal/monitor"
 	"gamarr/internal/platform"
@@ -47,6 +48,11 @@ type Server struct {
 	sessions  *SessionStore
 	scheduler *scheduler.Scheduler
 	oidc      *OIDCHandler
+
+	// meta is built once per server: it holds the cached IGDB app token and
+	// that provider's rate-limiter state, both of which would be discarded if
+	// a resolver were constructed per request.
+	meta *metadata.Resolver
 }
 
 // NewRouter creates a new chi router with all routes.
@@ -54,6 +60,13 @@ func NewRouter(cfg *config.Config, mgr *download.Manager, mon *monitor.GamarrMon
 	sessions := NewSessionStore()
 	oidcHandler := NewOIDCHandler(cfg, mgr.Jobs(), sessions)
 	s := &Server{cfg: cfg, mgr: mgr, mon: mon, sab: sab, sessions: sessions, scheduler: sched, oidc: oidcHandler}
+	s.meta = metadata.NewResolver(metadata.ResolverConfig{
+		IGDBClientID:     cfg.IGDBClientID,
+		IGDBClientSecret: cfg.IGDBClientSecret,
+		RAWGAPIKey:       cfg.RAWGAPIKey,
+		CacheTTL:         time.Duration(cfg.MetadataCacheTTLMinutes) * time.Minute,
+		Cache:            mgr.Jobs(),
+	})
 
 	// Rate limiter: 60-second window.
 	rl := NewRateLimiter(60, map[string]int{
