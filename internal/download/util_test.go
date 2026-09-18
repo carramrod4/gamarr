@@ -39,10 +39,20 @@ func TestCleanTitle(t *testing.T) {
 		{"dump marker", "Super Mario World (U) [!].sfc", "Super Mario World"},
 		{"revision tag", "Chrono Trigger (USA) (Rev 1).sfc", "Chrono Trigger"},
 
-		{"double archive extension", "RetroArch_data.tar.gz", "RetroArch_data"},
+		// Stacked extension stripped, then the underscore normalized because
+		// the remaining name has no spaces of its own.
+		{"double archive extension", "RetroArch_data.tar.gz", "RetroArch data"},
 		// Real files in this library are named exactly like this.
 		{"doubled extension", "Lumines.rar.rar", "Lumines"},
 		{"a non-extension suffix stops the loop", "Spiderman.2.rar", "Spiderman.2"},
+
+		// Separator normalization, only when the name has no spaces of its own.
+		{"underscore separated", "jikkyo_power_pro_wrestling", "jikkyo power pro wrestling"},
+		{"dash separated with a trailing rar word", "Nascar-07-rar", "Nascar 07"},
+		{"underscore separated with a trailing rar word", "Ape_Academy_2_rar", "Ape Academy 2"},
+		{"catalogue number prefix", "0663 - Barbie in the 12 Dancing Princesses", "Barbie in the 12 Dancing Princesses"},
+		{"spaced titles keep their hyphens", "Spider-Man - The Movie", "Spider-Man - The Movie"},
+		{"a title that is only a separator word survives", "rar", "rar"},
 
 		// Must not be mangled.
 		{"unknown extension stays", "My Game.documentary", "My Game.documentary"},

@@ -4,6 +4,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"regexp"
 	"strings"
 
 	"gamarr/internal/db"
@@ -275,7 +276,37 @@ func cleanTitle(name string) string {
 		name = name[:len(name)-len(ext)]
 	}
 
-	return strings.TrimSpace(stripROMTags(name))
+	return strings.TrimSpace(normalizeSeparators(stripROMTags(name)))
+}
+
+// catalogPrefix matches the "0663 - " numbering that DS and similar ROM sets
+// prepend. It is a set-internal catalogue number, meaningless to a provider.
+var catalogPrefix = regexp.MustCompile(`^\d{3,5}\s*-\s*`)
+
+// normalizeSeparators turns underscore/dash-separated ROM filenames into
+// something a provider can search.
+//
+// Only applied when the name has no spaces at all, which is the signal that
+// the separators ARE the spaces ("jikkyo_power_pro_wrestling",
+// "Nascar-07-rar"). A name that already contains spaces is left alone, so a
+// genuine hyphenated title like "Spider-Man - The Movie" keeps its punctuation.
+func normalizeSeparators(name string) string {
+	name = catalogPrefix.ReplaceAllString(name, "")
+
+	if !strings.ContainsAny(name, " ") && strings.ContainsAny(name, "_-") {
+		name = strings.NewReplacer("_", " ", "-", " ").Replace(name)
+	}
+
+	// A trailing bare "rar"/"zip"/"7z" word is what is left when the extension
+	// was part of the name rather than a real suffix ("Ape_Academy_2_rar").
+	fields := strings.Fields(name)
+	if n := len(fields); n > 1 {
+		switch strings.ToLower(fields[n-1]) {
+		case "rar", "zip", "7z", "iso":
+			fields = fields[:n-1]
+		}
+	}
+	return strings.Join(fields, " ")
 }
 
 // stripROMTags removes the trailing "(E)", "(USA)", "(Rev 1)", "[!]" style
