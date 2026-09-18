@@ -76,6 +76,11 @@ func (m *Manager) scanVault(dir string) int {
 	return added
 }
 
+// minROMFileSize is the smallest a non-PC file can be and still be treated as
+// a game. Small enough to admit an 8-bit ROM (a 16 KB NES cartridge dump is
+// real), large enough to reject a truncated download or a zero-byte stub.
+const minROMFileSize = 16 * 1024
+
 // gameExtensions are file extensions that represent playable games/ROMs.
 var gameExtensions = map[string]bool{
 	".nsp": true, ".xci": true, ".nsz": true, // Switch
@@ -122,8 +127,18 @@ func (m *Manager) scanDir(dir, platform, platformSlug string, isPC bool) int {
 			// Single file — check if it's a game file
 			ext := strings.ToLower(filepath.Ext(name))
 			if isPC || gameExtensions[ext] {
-				// Skip small files (DLC, updates, sidecars)
-				if info, err := e.Info(); err == nil && info.Size() < 1_000_000 && !isPC {
+				// Skip files too small to be a real game. The threshold used to
+				// be 1 MB, which quietly hid most retro libraries: an NES ROM
+				// is typically 24-512 KB, so of 1,624 .nes files on the
+				// reference install only 3 were large enough to be indexed, and
+				// nearly half the SNES and Genesis sets were invisible too.
+				//
+				// A big threshold was never doing much work anyway: the
+				// gameExtensions check above already rejects sidecars and
+				// notes by extension, and DLC/update files are filtered by
+				// name below. What remains worth catching is a truncated or
+				// placeholder file, hence a deliberately tiny floor.
+				if info, err := e.Info(); err == nil && info.Size() < minROMFileSize && !isPC {
 					continue
 				}
 				// Skip update files

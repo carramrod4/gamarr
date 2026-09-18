@@ -6,9 +6,15 @@ import (
 	"testing"
 )
 
-// bigROM is >1MB so ROM scans don't skip it as a small sidecar file.
+// bigROM is comfortably above minROMFileSize so ROM scans keep it.
 func bigROM() []byte {
 	return bytes.Repeat([]byte("R"), 1_100_000)
+}
+
+// realisticNESROM is the size of an actual 8-bit cartridge dump - far below the
+// old 1 MB floor that hid 1,621 of this library's 1,624 NES files.
+func realisticNESROM() []byte {
+	return bytes.Repeat([]byte("N"), 40*1024)
 }
 
 func TestScanLibraryDirs(t *testing.T) {
@@ -25,12 +31,17 @@ func TestScanLibraryDirs(t *testing.T) {
 	// ROMs: platform dirs with mixed content.
 	snes := filepath.Join(cfg.GamesRomsPath, "snes")
 	writeFileT(t, filepath.Join(snes, "Mario World.sfc"), bigROM())
-	writeFileT(t, filepath.Join(snes, "tiny.sfc"), []byte("small"))              // <1MB skipped
+	writeFileT(t, filepath.Join(snes, "tiny.sfc"), []byte("small"))              // below minROMFileSize, skipped
 	writeFileT(t, filepath.Join(snes, "[Update] Game v2.sfc"), bigROM())         // update skipped
 	writeFileT(t, filepath.Join(snes, "Hero costume pack.sfc"), bigROM())        // DLC skipped
 	writeFileT(t, filepath.Join(snes, "readme.txt"), []byte("not a game"))       // wrong ext
 	writeFileT(t, filepath.Join(snes, "Nested Pack", "inner.sfc"), bigROM())     // game folder
 	writeFileT(t, filepath.Join(snes, "org-only", "notes.md"), []byte("no rom")) // recursed, empty
+
+	// A genuinely small cartridge dump must be indexed, not treated as a
+	// sidecar - this is the case the old 1 MB floor got wrong.
+	nes := filepath.Join(cfg.GamesRomsPath, "nes")
+	writeFileT(t, filepath.Join(nes, "Metroid.nes"), realisticNESROM())
 
 	m.ScanLibraryDirs()
 
@@ -39,6 +50,7 @@ func TestScanLibraryDirs(t *testing.T) {
 		"scan:" + filepath.Join(cfg.GamesVaultPath, "Game Two.zip"),
 		"scan:" + filepath.Join(snes, "Mario World.sfc"),
 		"scan:" + filepath.Join(snes, "Nested Pack"),
+		"scan:" + filepath.Join(nes, "Metroid.nes"),
 	}
 	for _, id := range wantSourceIDs {
 		if !jobs.LibraryHasSourceID(id) {
