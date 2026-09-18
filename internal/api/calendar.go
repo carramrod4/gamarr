@@ -1,294 +1,266 @@
 package api
 
 import (
-	"encoding/json"
-	"fmt"
-	"log/slog"
+	"context"
 	"net/http"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
+
+	"gamarr/internal/metadata"
 )
 
-// calendarCache stores cached RAWG API results.
+// The calendar previously called RAWG directly, which meant it went silently
+// empty whenever RAWG_API_KEY was unset - the state this deployment was
+// actually in, so the feature had never worked here at all. It now goes through
+// the metadata resolver, so it uses whichever provider is configured (IGDB
+// first, RAWG as fallback) and reports honestly when none is.
+
+// calendarCacheTTL bounds how long a fetched window stays usable. Release dates
+// move on the order of days, so hours of staleness costs nothing and keeps the
+// IGDB rate limit well clear.
+const calendarCacheTTL = 6 * time.Hour
+
+// calendarWindowDays is how far either side of today gets fetched and cached.
+// A request for fewer days is served by filtering this window rather than by a
+// second upstream call.
+const calendarWindowDays = 90
+
+// calendarCache caches the fetched release windows. It is a package-level value
+// rather than a Server field to preserve the original behavior (one cache for
+// the process); the mutex guards every field.
 var calendarCache struct {
-	mu          sync.RWMutex
+	mu sync.RWMutex
+	// refresh serializes upstream fetches. Without it, every request arriving
+	// while the cache is cold starts its own multi-page provider walk - and a
+	// full window is now a dozen upstream calls, so that is a real cost, not a
+	// theoretical one. Held across the fetch, which is why it is separate from
+	// mu (held only for the field writes).
+	refresh     sync.Mutex
 	upcoming    []calendarEntry
 	recent      []calendarEntry
 	lastFetched time.Time
-	cacheTTL    time.Duration
-}
-
-func init() {
-	calendarCache.cacheTTL = 6 * time.Hour
+	// lastErr records why the most recent refresh produced nothing, so the
+	// handler can distinguish "no provider configured" and "provider down"
+	// from a genuinely empty window.
+	lastErr string
 }
 
 // calendarEntry represents a game release.
+//
+// The response keys are kept as the RAWG-backed version had them so any
+// existing client keeps working (the bundled React UI does not consume this
+// route at all yet - verified, not assumed). Source and InLibrary are additive;
+// the old RAWG-specific numeric id is gone, since it identified a row in one
+// provider's catalogue and means nothing once several providers can answer.
 type calendarEntry struct {
-	ID              int      `json:"id"`
 	Name            string   `json:"name"`
 	ReleaseDate     string   `json:"release_date"`
 	Platforms       []string `json:"platforms"`
 	BackgroundImage string   `json:"background_image,omitempty"`
 	Rating          float64  `json:"rating"`
 	OnWishlist      bool     `json:"on_wishlist"`
+	InLibrary       bool     `json:"in_library"`
+	Source          string   `json:"source,omitempty"`
 }
 
-// rawgGame represents a game from the RAWG API.
-type rawgGame struct {
-	ID              int     `json:"id"`
-	Name            string  `json:"name"`
-	Released        string  `json:"released"`
-	BackgroundImage string  `json:"background_image"`
-	Rating          float64 `json:"rating"`
-	Platforms       []struct {
-		Platform struct {
-			Name string `json:"name"`
-			Slug string `json:"slug"`
-		} `json:"platform"`
-	} `json:"platforms"`
-}
-
-type rawgResponse struct {
-	Results []rawgGame `json:"results"`
-}
-
-// handleCalendar handles GET /api/calendar — upcoming game releases.
+// handleCalendar handles GET /api/calendar - upcoming game releases.
 func (s *Server) handleCalendar(w http.ResponseWriter, r *http.Request) {
-	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
-	if days <= 0 {
-		days = 30
-	}
-	if days > 365 {
-		days = 365
-	}
-	platformFilter := r.URL.Query().Get("platform")
-
-	entries := s.getUpcomingReleases(days)
-
-	// Filter by platform if specified
-	if platformFilter != "" && platformFilter != "all" {
-		var filtered []calendarEntry
-		for _, e := range entries {
-			for _, p := range e.Platforms {
-				if strings.EqualFold(p, platformFilter) || strings.EqualFold(slugify(p), platformFilter) {
-					filtered = append(filtered, e)
-					break
-				}
-			}
-		}
-		entries = filtered
-	}
-
-	// Cross-reference with wishlist
-	wishlist := s.mgr.Jobs().GetWishlist()
-	wishlistMap := make(map[string]bool)
-	for _, w := range wishlist {
-		wishlistMap[strings.ToLower(strings.TrimSpace(w.Title))] = true
-	}
-	for i := range entries {
-		if wishlistMap[strings.ToLower(strings.TrimSpace(entries[i].Name))] {
-			entries[i].OnWishlist = true
-		}
-	}
-
-	if entries == nil {
-		entries = []calendarEntry{}
-	}
-
-	writeJSON(w, http.StatusOK, map[string]interface{}{
-		"success": true,
-		"entries": entries,
-		"total":   len(entries),
-		"days":    days,
-	})
+	s.writeCalendar(w, r, true)
 }
 
-// handleCalendarRecent handles GET /api/calendar/recent — recently released games.
+// handleCalendarRecent handles GET /api/calendar/recent - recent releases.
 func (s *Server) handleCalendarRecent(w http.ResponseWriter, r *http.Request) {
+	s.writeCalendar(w, r, false)
+}
+
+func (s *Server) writeCalendar(w http.ResponseWriter, r *http.Request, upcoming bool) {
 	days, _ := strconv.Atoi(r.URL.Query().Get("days"))
 	if days <= 0 {
 		days = 30
 	}
-	platformFilter := r.URL.Query().Get("platform")
-
-	entries := s.getRecentReleases(days)
-
-	if platformFilter != "" && platformFilter != "all" {
-		var filtered []calendarEntry
-		for _, e := range entries {
-			for _, p := range e.Platforms {
-				if strings.EqualFold(p, platformFilter) || strings.EqualFold(slugify(p), platformFilter) {
-					filtered = append(filtered, e)
-					break
-				}
-			}
-		}
-		entries = filtered
+	if days > calendarWindowDays {
+		days = calendarWindowDays
 	}
 
-	// Cross-reference with wishlist
-	wishlist := s.mgr.Jobs().GetWishlist()
-	wishlistMap := make(map[string]bool)
-	for _, w := range wishlist {
-		wishlistMap[strings.ToLower(strings.TrimSpace(w.Title))] = true
-	}
-	for i := range entries {
-		if wishlistMap[strings.ToLower(strings.TrimSpace(entries[i].Name))] {
-			entries[i].OnWishlist = true
-		}
-	}
+	entries, refreshErr := s.releaseWindow(r.Context(), days, upcoming)
+	entries = filterByPlatform(entries, r.URL.Query().Get("platform"))
+	s.annotateOwnership(entries)
 
 	if entries == nil {
 		entries = []calendarEntry{}
 	}
 
-	writeJSON(w, http.StatusOK, map[string]interface{}{
+	resp := map[string]interface{}{
 		"success": true,
 		"entries": entries,
 		"total":   len(entries),
 		"days":    days,
-	})
+	}
+	// An empty calendar has two very different causes. Saying which one it is
+	// here is the difference between "nothing is coming out" and "metadata is
+	// not configured", which looked identical in the RAWG-only version.
+	if len(entries) == 0 && refreshErr != "" {
+		resp["warning"] = refreshErr
+	}
+	writeJSON(w, http.StatusOK, resp)
 }
 
-func (s *Server) getUpcomingReleases(days int) []calendarEntry {
+// releaseWindow returns the cached window trimmed to the requested day count,
+// refreshing the cache when it has expired.
+func (s *Server) releaseWindow(ctx context.Context, days int, upcoming bool) ([]calendarEntry, string) {
 	calendarCache.mu.RLock()
-	if time.Since(calendarCache.lastFetched) < calendarCache.cacheTTL && calendarCache.upcoming != nil {
-		result := make([]calendarEntry, len(calendarCache.upcoming))
-		copy(result, calendarCache.upcoming)
-		calendarCache.mu.RUnlock()
-
-		// Filter to requested day range
-		cutoff := time.Now().AddDate(0, 0, days).Format("2006-01-02")
-		var filtered []calendarEntry
-		for _, e := range result {
-			if e.ReleaseDate <= cutoff {
-				filtered = append(filtered, e)
-			}
-		}
-		return filtered
-	}
+	fresh := time.Since(calendarCache.lastFetched) < calendarCacheTTL
 	calendarCache.mu.RUnlock()
 
-	// Fetch from RAWG
-	s.refreshCalendarCache()
+	if !fresh {
+		s.refreshCalendarCache(ctx)
+	}
 
 	calendarCache.mu.RLock()
 	defer calendarCache.mu.RUnlock()
 
-	cutoff := time.Now().AddDate(0, 0, days).Format("2006-01-02")
-	var filtered []calendarEntry
-	for _, e := range calendarCache.upcoming {
-		if e.ReleaseDate <= cutoff {
-			filtered = append(filtered, e)
+	now := time.Now()
+	var src []calendarEntry
+	var lo, hi string
+	if upcoming {
+		src = calendarCache.upcoming
+		lo, hi = now.Format(dateLayout), now.AddDate(0, 0, days).Format(dateLayout)
+	} else {
+		src = calendarCache.recent
+		lo, hi = now.AddDate(0, 0, -days).Format(dateLayout), now.Format(dateLayout)
+	}
+
+	out := make([]calendarEntry, 0, len(src))
+	for _, e := range src {
+		if e.ReleaseDate >= lo && e.ReleaseDate <= hi {
+			out = append(out, e)
 		}
 	}
-	return filtered
+	return out, calendarCache.lastErr
 }
 
-func (s *Server) getRecentReleases(days int) []calendarEntry {
-	calendarCache.mu.RLock()
-	if time.Since(calendarCache.lastFetched) < calendarCache.cacheTTL && calendarCache.recent != nil {
-		result := make([]calendarEntry, len(calendarCache.recent))
-		copy(result, calendarCache.recent)
-		calendarCache.mu.RUnlock()
+const dateLayout = "2006-01-02"
 
-		cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
-		var filtered []calendarEntry
-		for _, e := range result {
-			if e.ReleaseDate >= cutoff {
-				filtered = append(filtered, e)
-			}
-		}
-		return filtered
-	}
+// refreshCalendarCache fetches one window spanning calendarWindowDays either
+// side of today and splits it at today, so both handlers are served by a single
+// upstream call instead of two.
+func (s *Server) refreshCalendarCache(ctx context.Context) {
+	calendarCache.refresh.Lock()
+	defer calendarCache.refresh.Unlock()
+
+	// Another request may have refreshed while this one waited for the lock.
+	calendarCache.mu.RLock()
+	fresh := time.Since(calendarCache.lastFetched) < calendarCacheTTL
 	calendarCache.mu.RUnlock()
-
-	s.refreshCalendarCache()
-
-	calendarCache.mu.RLock()
-	defer calendarCache.mu.RUnlock()
-
-	cutoff := time.Now().AddDate(0, 0, -days).Format("2006-01-02")
-	var filtered []calendarEntry
-	for _, e := range calendarCache.recent {
-		if e.ReleaseDate >= cutoff {
-			filtered = append(filtered, e)
-		}
-	}
-	return filtered
-}
-
-func (s *Server) refreshCalendarCache() {
-	if !s.cfg.HasRAWG() {
-		// No RAWG API key, return empty
-		calendarCache.mu.Lock()
-		calendarCache.upcoming = []calendarEntry{}
-		calendarCache.recent = []calendarEntry{}
-		calendarCache.lastFetched = time.Now()
-		calendarCache.mu.Unlock()
+	if fresh {
 		return
 	}
 
 	now := time.Now()
-	today := now.Format("2006-01-02")
-	futureDate := now.AddDate(0, 0, 90).Format("2006-01-02") // Cache 90 days ahead
-	pastDate := now.AddDate(0, 0, -90).Format("2006-01-02")  // Cache 90 days back
+	from := now.AddDate(0, 0, -calendarWindowDays)
+	to := now.AddDate(0, 0, calendarWindowDays)
 
-	// Fetch upcoming
-	upcoming := s.fetchRAWGGames(today, futureDate, "released")
-	// Fetch recent
-	recent := s.fetchRAWGGames(pastDate, today, "-released")
+	var entries []calendarEntry
+	var errMsg string
+
+	// CanBrowseReleases rather than Enabled: Steam is always enabled (it needs
+	// no credentials) but cannot answer a date-range query, so Enabled() alone
+	// would report a configured calendar that can only ever come back empty.
+	if s.meta == nil || !s.meta.CanBrowseReleases() {
+		errMsg = "No metadata provider that can list releases by date is configured. Set IGDB_CLIENT_ID and IGDB_CLIENT_SECRET (or RAWG_API_KEY) to populate the release calendar."
+	} else {
+		games, err := s.meta.ReleasesBetween(ctx, from, to, 0)
+		if err != nil && len(games) == 0 {
+			errMsg = "Could not reach the metadata provider: " + err.Error()
+		}
+		metadata.SortByReleaseDate(games)
+		for _, g := range games {
+			if g == nil || g.Title == "" || g.ReleaseDate == "" {
+				continue
+			}
+			entries = append(entries, calendarEntry{
+				Name:            g.Title,
+				ReleaseDate:     g.ReleaseDate,
+				Platforms:       g.Platforms,
+				BackgroundImage: g.CoverArt,
+				Rating:          g.Rating,
+				Source:          g.Sources[metadata.FieldTitle],
+			})
+		}
+	}
+
+	today := now.Format(dateLayout)
+	var upcoming, recent []calendarEntry
+	for _, e := range entries {
+		if e.ReleaseDate >= today {
+			upcoming = append(upcoming, e)
+		} else {
+			recent = append(recent, e)
+		}
+	}
+	// recent reads newest-first, which is the order a "recently released" list
+	// wants; upcoming stays soonest-first.
+	for i, j := 0, len(recent)-1; i < j; i, j = i+1, j-1 {
+		recent[i], recent[j] = recent[j], recent[i]
+	}
 
 	calendarCache.mu.Lock()
 	calendarCache.upcoming = upcoming
 	calendarCache.recent = recent
 	calendarCache.lastFetched = time.Now()
+	calendarCache.lastErr = errMsg
 	calendarCache.mu.Unlock()
 }
 
-func (s *Server) fetchRAWGGames(dateFrom, dateTo, ordering string) []calendarEntry {
-	url := fmt.Sprintf(
-		"https://api.rawg.io/api/games?key=%s&dates=%s,%s&ordering=%s&page_size=40",
-		s.cfg.RAWGAPIKey, dateFrom, dateTo, ordering,
-	)
-
-	client := &http.Client{Timeout: 15 * time.Second}
-	resp, err := client.Get(url)
-	if err != nil {
-		slog.Warn("RAWG API error", "error", err)
-		return nil
+// filterByPlatform keeps entries matching a platform name or slug. An empty
+// filter or "all" keeps everything.
+func filterByPlatform(entries []calendarEntry, platform string) []calendarEntry {
+	if platform == "" || platform == "all" {
+		return entries
 	}
-	defer resp.Body.Close()
-
-	if resp.StatusCode != 200 {
-		slog.Warn("RAWG API bad status", "status", resp.StatusCode)
-		return nil
-	}
-
-	var rawgResp rawgResponse
-	if err := json.NewDecoder(resp.Body).Decode(&rawgResp); err != nil {
-		slog.Warn("RAWG API decode error", "error", err)
-		return nil
-	}
-
-	var entries []calendarEntry
-	for _, g := range rawgResp.Results {
-		var platforms []string
-		for _, p := range g.Platforms {
-			platforms = append(platforms, p.Platform.Name)
+	out := make([]calendarEntry, 0, len(entries))
+	for _, e := range entries {
+		for _, p := range e.Platforms {
+			if strings.EqualFold(p, platform) || strings.EqualFold(slugify(p), platform) {
+				out = append(out, e)
+				break
+			}
 		}
-		entries = append(entries, calendarEntry{
-			ID:              g.ID,
-			Name:            g.Name,
-			ReleaseDate:     g.Released,
-			Platforms:       platforms,
-			BackgroundImage: g.BackgroundImage,
-			Rating:          g.Rating,
-		})
 	}
-	return entries
+	return out
+}
+
+// annotateOwnership marks entries the user already wishlisted or owns.
+//
+// Both are matched with the resolver's own title normalization rather than a
+// local rule, so "Hollow Knight: Silksong" from a provider and a hand-typed
+// wishlist entry collapse to the same key the resolver would use.
+func (s *Server) annotateOwnership(entries []calendarEntry) {
+	if len(entries) == 0 {
+		return
+	}
+
+	wishlisted := make(map[string]bool)
+	for _, wl := range s.mgr.Jobs().GetWishlist() {
+		wishlisted[metadata.NormalizeForMatch(wl.Title)] = true
+	}
+
+	owned := make(map[string]bool)
+	for key := range s.mgr.Jobs().GetAllLibraryTitles() {
+		// Keys are "lowercased title|platform_slug"; the calendar has no
+		// platform to match against, so only the title half is used.
+		if idx := strings.LastIndex(key, "|"); idx >= 0 {
+			owned[metadata.NormalizeForMatch(key[:idx])] = true
+		}
+	}
+
+	for i := range entries {
+		k := metadata.NormalizeForMatch(entries[i].Name)
+		entries[i].OnWishlist = wishlisted[k]
+		entries[i].InLibrary = owned[k]
+	}
 }
 
 func slugify(name string) string {

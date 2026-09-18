@@ -137,6 +137,8 @@ func NewRouter(cfg *config.Config, mgr *download.Manager, mon *monitor.GamarrMon
 
 	// Library
 	r.Get("/api/library", s.handleLibrary)
+	r.Get("/api/library/{id}", s.handleLibraryItem)
+	r.Put("/api/library/{id}/monitored", s.handleSetLibraryItemMonitored)
 	r.Delete("/api/library/{id}", s.handleDeleteLibraryItem)
 
 	// Wishlist

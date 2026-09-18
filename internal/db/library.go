@@ -21,7 +21,11 @@ type LibraryItem struct {
 	SourceType   string `json:"source_type"` // "prowlarr", "myrient", "vimm", "minerva", "manual"
 	SourceID     string `json:"source_id"`   // dedup key (hash, url, etc.)
 	Metadata     string `json:"metadata"`    // JSON blob
-	AddedAt      string `json:"added_at"`
+	// Monitored mirrors Sonarr/Radarr's per-item monitored flag: whether
+	// Gamarr should keep looking for a better release of this game. New rows
+	// default to monitored (see AddLibraryItem).
+	Monitored bool   `json:"monitored"`
+	AddedAt   string `json:"added_at"`
 }
 
 // WishlistItem represents a game on the wishlist.
@@ -53,6 +57,33 @@ type LibraryPage struct {
 	TotalPages int           `json:"total_pages"`
 }
 
+// libraryColumns is the canonical column list for every library_items read.
+// It was inline in seven separate queries before; keeping it in one place is
+// what makes adding a column (like monitored) a single edit instead of seven
+// that must agree with each other and with every Scan call.
+const libraryColumns = "id, title, platform, platform_slug, is_pc, file_path, " +
+	"file_size, source, source_type, source_id, metadata, monitored, added_at"
+
+// rowScanner is satisfied by both *sql.Row and *sql.Rows.
+type rowScanner interface {
+	Scan(dest ...interface{}) error
+}
+
+// scanLibraryItem reads one row selected with libraryColumns.
+func scanLibraryItem(sc rowScanner) (LibraryItem, error) {
+	var item LibraryItem
+	var isPC, monitored int
+	err := sc.Scan(&item.ID, &item.Title, &item.Platform, &item.PlatformSlug,
+		&isPC, &item.FilePath, &item.FileSize, &item.Source, &item.SourceType,
+		&item.SourceID, &item.Metadata, &monitored, &item.AddedAt)
+	if err != nil {
+		return LibraryItem{}, err
+	}
+	item.IsPC = isPC != 0
+	item.Monitored = monitored != 0
+	return item, nil
+}
+
 func (s *JobStore) migrateExtra() {
 	s.migrateRequests()
 	s.migrateNotifications()
@@ -77,6 +108,7 @@ func (s *JobStore) migrateExtra() {
 			source_type TEXT NOT NULL DEFAULT '',
 			source_id TEXT NOT NULL DEFAULT '',
 			metadata TEXT NOT NULL DEFAULT '{}',
+			monitored INTEGER NOT NULL DEFAULT 1,
 			added_at TEXT NOT NULL DEFAULT (datetime('now'))
 		)`,
 		`CREATE TABLE IF NOT EXISTS wishlist (
@@ -104,6 +136,12 @@ func (s *JobStore) migrateExtra() {
 			slog.Warn("migrate extra table", "error", err)
 		}
 	}
+
+	// Upgrade path for databases created before the column existed. The error
+	// is discarded deliberately: SQLite has no ADD COLUMN IF NOT EXISTS, so a
+	// "duplicate column name" failure here is the normal steady state. Same
+	// idiom as migrateUsers' TOTP columns.
+	s.db.Exec("ALTER TABLE library_items ADD COLUMN monitored INTEGER NOT NULL DEFAULT 1")
 }
 
 // DB returns the underlying sql.DB for direct use.
@@ -114,6 +152,10 @@ func (s *JobStore) DB() *sql.DB {
 // ── Library Items ──────────────────────────────────────────────────────────────
 
 // AddLibraryItem inserts a new library item.
+//
+// monitored is deliberately left out of the column list so the schema default
+// (1) applies: a newly added game is monitored, matching Sonarr/Radarr. Callers
+// that want it off flip it afterwards with SetLibraryItemMonitored.
 func (s *JobStore) AddLibraryItem(item *LibraryItem) (int64, error) {
 	result, err := s.db.Exec(
 		`INSERT INTO library_items (title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata)
@@ -146,7 +188,7 @@ func (s *JobStore) GetLibraryPage(page, pageSize int, query, platformSlug string
 	offset := (page - 1) * pageSize
 
 	rows, err := s.db.Query(
-		"SELECT id, title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata, added_at FROM library_items "+
+		"SELECT "+libraryColumns+" FROM library_items "+
 			where+" ORDER BY added_at DESC LIMIT ? OFFSET ?",
 		append(args, pageSize, offset)...,
 	)
@@ -157,12 +199,10 @@ func (s *JobStore) GetLibraryPage(page, pageSize int, query, platformSlug string
 
 	var items []LibraryItem
 	for rows.Next() {
-		var item LibraryItem
-		var isPC int
-		rows.Scan(&item.ID, &item.Title, &item.Platform, &item.PlatformSlug,
-			&isPC, &item.FilePath, &item.FileSize, &item.Source, &item.SourceType,
-			&item.SourceID, &item.Metadata, &item.AddedAt)
-		item.IsPC = isPC != 0
+		item, err := scanLibraryItem(rows)
+		if err != nil {
+			continue
+		}
 		items = append(items, item)
 	}
 	if items == nil {
@@ -181,18 +221,13 @@ func (s *JobStore) GetLibraryPage(page, pageSize int, query, platformSlug string
 // GetLibraryItem returns a single library item by ID.
 func (s *JobStore) GetLibraryItem(id int64) (*LibraryItem, error) {
 	row := s.db.QueryRow(
-		"SELECT id, title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata, added_at FROM library_items WHERE id = ?",
+		"SELECT "+libraryColumns+" FROM library_items WHERE id = ?",
 		id,
 	)
-	var item LibraryItem
-	var isPC int
-	err := row.Scan(&item.ID, &item.Title, &item.Platform, &item.PlatformSlug,
-		&isPC, &item.FilePath, &item.FileSize, &item.Source, &item.SourceType,
-		&item.SourceID, &item.Metadata, &item.AddedAt)
+	item, err := scanLibraryItem(row)
 	if err != nil {
 		return nil, err
 	}
-	item.IsPC = isPC != 0
 	return &item, nil
 }
 
@@ -200,6 +235,20 @@ func (s *JobStore) GetLibraryItem(id int64) (*LibraryItem, error) {
 func (s *JobStore) UpdateLibraryItemMetadata(id int64, metadata string) error {
 	_, err := s.db.Exec("UPDATE library_items SET metadata = ? WHERE id = ?", metadata, id)
 	return err
+}
+
+// SetLibraryItemMonitored flips the monitored flag for one library item.
+// A missing id is reported as an error rather than silently succeeding, so an
+// API caller gets a 404 instead of a false confirmation.
+func (s *JobStore) SetLibraryItemMonitored(id int64, monitored bool) error {
+	res, err := s.db.Exec("UPDATE library_items SET monitored = ? WHERE id = ?", boolToInt(monitored), id)
+	if err != nil {
+		return err
+	}
+	if n, err := res.RowsAffected(); err == nil && n == 0 {
+		return sql.ErrNoRows
+	}
+	return nil
 }
 
 // DeleteLibraryItem deletes a library item by ID.
@@ -405,33 +454,27 @@ func (s *JobStore) FindLibraryByTitle(title, platformSlug string) *LibraryItem {
 
 	if platformSlug != "" && platformSlug != "all" {
 		if platformSlug == "pc" {
-			query = "SELECT id, title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata, added_at FROM library_items WHERE LOWER(title) = ? AND is_pc = 1 LIMIT 1"
+			query = "SELECT " + libraryColumns + " FROM library_items WHERE LOWER(title) = ? AND is_pc = 1 LIMIT 1"
 			args = []interface{}{normalizedTitle}
 		} else {
-			query = "SELECT id, title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata, added_at FROM library_items WHERE LOWER(title) = ? AND platform_slug = ? LIMIT 1"
+			query = "SELECT " + libraryColumns + " FROM library_items WHERE LOWER(title) = ? AND platform_slug = ? LIMIT 1"
 			args = []interface{}{normalizedTitle, platformSlug}
 		}
 	} else {
-		query = "SELECT id, title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata, added_at FROM library_items WHERE LOWER(title) = ? LIMIT 1"
+		query = "SELECT " + libraryColumns + " FROM library_items WHERE LOWER(title) = ? LIMIT 1"
 		args = []interface{}{normalizedTitle}
 	}
 
-	row := s.db.QueryRow(query, args...)
-	var item LibraryItem
-	var isPC int
-	err := row.Scan(&item.ID, &item.Title, &item.Platform, &item.PlatformSlug,
-		&isPC, &item.FilePath, &item.FileSize, &item.Source, &item.SourceType,
-		&item.SourceID, &item.Metadata, &item.AddedAt)
+	item, err := scanLibraryItem(s.db.QueryRow(query, args...))
 	if err != nil {
 		return nil
 	}
-	item.IsPC = isPC != 0
 	return &item
 }
 
 // GetAllLibraryTitles returns a map of normalized "title|platform_slug" to LibraryItem for bulk lookups.
 func (s *JobStore) GetAllLibraryTitles() map[string]*LibraryItem {
-	rows, err := s.db.Query("SELECT id, title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata, added_at FROM library_items")
+	rows, err := s.db.Query("SELECT " + libraryColumns + " FROM library_items")
 	if err != nil {
 		return nil
 	}
@@ -439,14 +482,10 @@ func (s *JobStore) GetAllLibraryTitles() map[string]*LibraryItem {
 
 	result := make(map[string]*LibraryItem)
 	for rows.Next() {
-		var item LibraryItem
-		var isPC int
-		if err := rows.Scan(&item.ID, &item.Title, &item.Platform, &item.PlatformSlug,
-			&isPC, &item.FilePath, &item.FileSize, &item.Source, &item.SourceType,
-			&item.SourceID, &item.Metadata, &item.AddedAt); err != nil {
+		item, err := scanLibraryItem(rows)
+		if err != nil {
 			continue
 		}
-		item.IsPC = isPC != 0
 		key := strings.ToLower(strings.TrimSpace(item.Title)) + "|" + item.PlatformSlug
 		cp := item
 		result[key] = &cp
@@ -479,7 +518,7 @@ func FormatSize(size int64) string {
 // RecentLibraryItems returns the most recently added items.
 func (s *JobStore) RecentLibraryItems(limit int) []LibraryItem {
 	rows, err := s.db.Query(
-		"SELECT id, title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata, added_at FROM library_items ORDER BY added_at DESC LIMIT ?",
+		"SELECT "+libraryColumns+" FROM library_items ORDER BY added_at DESC LIMIT ?",
 		limit,
 	)
 	if err != nil {
@@ -488,12 +527,10 @@ func (s *JobStore) RecentLibraryItems(limit int) []LibraryItem {
 	defer rows.Close()
 	var items []LibraryItem
 	for rows.Next() {
-		var item LibraryItem
-		var isPC int
-		rows.Scan(&item.ID, &item.Title, &item.Platform, &item.PlatformSlug,
-			&isPC, &item.FilePath, &item.FileSize, &item.Source, &item.SourceType,
-			&item.SourceID, &item.Metadata, &item.AddedAt)
-		item.IsPC = isPC != 0
+		item, err := scanLibraryItem(rows)
+		if err != nil {
+			continue
+		}
 		items = append(items, item)
 	}
 	return items
