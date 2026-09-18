@@ -40,6 +40,9 @@ func TestCleanTitle(t *testing.T) {
 		{"revision tag", "Chrono Trigger (USA) (Rev 1).sfc", "Chrono Trigger"},
 
 		{"double archive extension", "RetroArch_data.tar.gz", "RetroArch_data"},
+		// Real files in this library are named exactly like this.
+		{"doubled extension", "Lumines.rar.rar", "Lumines"},
+		{"a non-extension suffix stops the loop", "Spiderman.2.rar", "Spiderman.2"},
 
 		// Must not be mangled.
 		{"unknown extension stays", "My Game.documentary", "My Game.documentary"},

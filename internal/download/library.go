@@ -263,14 +263,16 @@ func cleanTitle(name string) string {
 	// nothing upstream (verified live: "EARTH BOUND.smc" resolves to nothing).
 	// Deriving it from one map means a newly supported format cannot be
 	// scannable but unstrippable again.
-	if ext := strings.ToLower(filepath.Ext(name)); ext != "" {
-		if gameExtensions[ext] || archiveExtensions[ext] {
-			name = name[:len(name)-len(ext)]
-			// ".tar.gz" leaves a trailing ".tar" behind.
-			if ext2 := strings.ToLower(filepath.Ext(name)); archiveExtensions[ext2] {
-				name = name[:len(name)-len(ext2)]
-			}
+	// Looped, because stacked extensions are real: ".tar.gz", and files that
+	// actually exist in this library named "Lumines.rar.rar". A non-game
+	// extension ends the loop, so "Spiderman.2.rar" correctly stops at
+	// "Spiderman.2" rather than eating part of the name.
+	for {
+		ext := strings.ToLower(filepath.Ext(name))
+		if ext == "" || !(gameExtensions[ext] || archiveExtensions[ext]) {
+			break
 		}
+		name = name[:len(name)-len(ext)]
 	}
 
 	return strings.TrimSpace(stripROMTags(name))
