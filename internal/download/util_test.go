@@ -16,11 +16,36 @@ func TestCleanTitle(t *testing.T) {
 		{"strip 7z extension", "Game.7z", "Game"},
 		{"strip iso extension", "Game.iso", "Game"},
 		{"URL decode spaces", "Super%20Mario%20Bros", "Super Mario Bros"},
-		{"URL decode parens", "Game%28USA%29", "Game(USA)"},
+		// Changed deliberately: the decoded "(USA)" is a ROM-set region tag,
+		// and leaving it on the title is what stopped these matching upstream.
+		{"URL decode parens, then strip the region tag", "Game%28USA%29", "Game"},
 		{"URL decode comma", "Game%2C Part 2", "Game, Part 2"},
 		{"trim whitespace", "  Game  ", "Game"},
 		{"no extension to strip", "Plain Game", "Plain Game"},
 		{"case insensitive ext", "Game.ZIP", "Game"},
+
+		// Extensions the previous hardcoded list omitted. Each of these kept
+		// its extension in the stored title, and none of them matched anything
+		// upstream (verified live against IGDB).
+		{"snes", "EARTH BOUND.smc", "EARTH BOUND"},
+		{"game boy", "Final Fantasy Adventure.gb", "Final Fantasy Adventure"},
+		{"game boy color", "Game.gbc", "Game"},
+		{"cue sheet", "Game.cue", "Game"},
+		{"dreamcast", "Game.cdi", "Game"},
+
+		// Region / dump / revision tags.
+		{"region tag with extension", "Donkey Kong Country 2 (E).smc", "Donkey Kong Country 2"},
+		{"us region tag", "ESPN Sunday Night NFL (US).smc", "ESPN Sunday Night NFL"},
+		{"dump marker", "Super Mario World (U) [!].sfc", "Super Mario World"},
+		{"revision tag", "Chrono Trigger (USA) (Rev 1).sfc", "Chrono Trigger"},
+
+		{"double archive extension", "RetroArch_data.tar.gz", "RetroArch_data"},
+
+		// Must not be mangled.
+		{"unknown extension stays", "My Game.documentary", "My Game.documentary"},
+		{"dots inside the title survive", "E.V.O. Search for Eden", "E.V.O. Search for Eden"},
+		{"a title that is only a tag is kept", "(Unknown)", "(Unknown)"},
+		{"empty", "", ""},
 	}
 
 	for _, tt := range tests {
@@ -120,6 +145,18 @@ func TestGameExtensions(t *testing.T) {
 	for _, ext := range notExpected {
 		if gameExtensions[ext] {
 			t.Errorf("expected %q NOT in gameExtensions", ext)
+		}
+	}
+}
+
+// Every extension the scanner accepts as a game must also be strippable. A
+// format that is scannable but not strippable is precisely the bug that left
+// thousands of ROMs with ".smc" in their title, so this pins the two together
+// rather than trusting a second hand-maintained list to keep up.
+func TestEveryGameExtensionIsStripped(t *testing.T) {
+	for ext := range gameExtensions {
+		if got := cleanTitle("Some Game" + ext); got != "Some Game" {
+			t.Errorf("cleanTitle(%q) = %q, want %q", "Some Game"+ext, got, "Some Game")
 		}
 	}
 }

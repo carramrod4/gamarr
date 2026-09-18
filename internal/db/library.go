@@ -431,6 +431,69 @@ func (s *JobStore) GetActivity(page, pageSize int) ([]ActivityEntry, int) {
 
 // ── Helpers ────────────────────────────────────────────────────────────────────
 
+// ScanMetadataByPath returns the metadata blob of every scan-sourced row that
+// has one, keyed by file path.
+//
+// It exists so a rescan can put enrichment back. ClearScanEntries deletes every
+// scan row and the rescan re-inserts them with an empty metadata blob, so
+// without this every container restart silently discarded all enriched
+// metadata - thousands of provider lookups thrown away on each boot. The file
+// path is the key because it is the one identifier that survives the
+// delete/re-insert cycle: ids are reassigned and titles can change when the
+// filename parser improves.
+func (s *JobStore) ScanMetadataByPath() map[string]string {
+	rows, err := s.db.Query(
+		"SELECT file_path, metadata FROM library_items WHERE source = 'scan' AND metadata != '' AND metadata != '{}'")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+
+	out := make(map[string]string)
+	for rows.Next() {
+		var path, metadata string
+		if err := rows.Scan(&path, &metadata); err != nil || path == "" {
+			continue
+		}
+		out[path] = metadata
+	}
+	return out
+}
+
+// RestoreScanMetadata writes saved metadata blobs back onto rows matched by
+// file path, and reports how many were restored. Paths no longer present (the
+// file was deleted or moved) simply match nothing.
+func (s *JobStore) RestoreScanMetadata(byPath map[string]string) int {
+	if len(byPath) == 0 {
+		return 0
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return 0
+	}
+	stmt, err := tx.Prepare("UPDATE library_items SET metadata = ? WHERE file_path = ? AND (metadata = '' OR metadata = '{}')")
+	if err != nil {
+		tx.Rollback()
+		return 0
+	}
+	defer stmt.Close()
+
+	restored := 0
+	for path, metadata := range byPath {
+		res, err := stmt.Exec(metadata, path)
+		if err != nil {
+			continue
+		}
+		if n, err := res.RowsAffected(); err == nil {
+			restored += int(n)
+		}
+	}
+	if err := tx.Commit(); err != nil {
+		return 0
+	}
+	return restored
+}
+
 // ClearScanEntries removes all library items added by directory scanning.
 // This is called before a rescan to ensure accuracy.
 func (s *JobStore) ClearScanEntries() {

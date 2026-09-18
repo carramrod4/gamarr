@@ -228,9 +228,10 @@ func TestScanSupersedesDownloadTimeRow(t *testing.T) {
 
 	// The surviving row must be the scan's: real size, filename-derived title,
 	// not the raw torrent name with its undecoded HTML entities.
-	// cleanTitle only strips the archive extension, so the scan's title is the
-	// filename minus ".tar" - not the torrent's name.
-	item := jobs.FindLibraryByTitle("Some Game [FitGirl Repack]", "")
+	// cleanTitle strips the archive extension AND the trailing "[FitGirl
+	// Repack]" tag, so the scan's title is the bare game name - a repack tag
+	// blocks a metadata match exactly like a ROM region tag does.
+	item := jobs.FindLibraryByTitle("Some Game", "")
 	if item == nil {
 		t.Fatal("scan-derived title not found - the download-time row won")
 	}

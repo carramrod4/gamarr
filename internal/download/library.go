@@ -12,6 +12,13 @@ import (
 // ScanLibraryDirs scans vault and ROM directories to populate the library.
 // Clears previous scan entries and rescans from scratch for accuracy.
 func (m *Manager) ScanLibraryDirs() {
+	// Enrichment lives on the library row, and the clear-and-rescan below
+	// deletes every scan row, re-inserting it with an empty metadata blob. So
+	// without carrying it across, every restart silently discarded all
+	// enriched metadata and it had to be fetched from the providers again.
+	// Keyed by file path, which survives the delete/re-insert cycle.
+	savedMetadata := m.jobs.ScanMetadataByPath()
+
 	// Clear previous scan entries so we always reflect current disk state
 	m.jobs.ClearScanEntries()
 	total := 0
@@ -35,6 +42,10 @@ func (m *Manager) ScanLibraryDirs() {
 				}
 			}
 		}
+	}
+
+	if restored := m.jobs.RestoreScanMetadata(savedMetadata); restored > 0 {
+		slog.Info("restored metadata after rescan", "items", restored)
 	}
 
 	if total > 0 {
@@ -230,20 +241,72 @@ func dirSize(path string) int64 {
 	return total
 }
 
+// archiveExtensions are container formats that are not themselves game files,
+// so they are absent from gameExtensions but still need stripping off a title.
+var archiveExtensions = map[string]bool{
+	".tar": true, ".gz": true, ".bz2": true, ".xz": true,
+}
+
+// cleanTitle turns a filename into something a metadata provider can match.
 func cleanTitle(name string) string {
-	// Remove common archive extensions
-	for _, ext := range []string{".zip", ".rar", ".7z", ".tar", ".tar.gz", ".iso", ".nsp", ".xci", ".cia", ".nds", ".gba", ".nes", ".sfc", ".n64", ".z64", ".chd", ".gdi", ".cso", ".pbp", ".gcz", ".wbfs"} {
-		if strings.HasSuffix(strings.ToLower(name), ext) {
-			name = name[:len(name)-len(ext)]
-			break
-		}
-	}
-	// URL-decode percent-encoded filenames
+	// URL-decode first, so a percent-encoded name still exposes its extension
+	// and tags to the steps below.
 	name = strings.ReplaceAll(name, "%20", " ")
 	name = strings.ReplaceAll(name, "%28", "(")
 	name = strings.ReplaceAll(name, "%29", ")")
 	name = strings.ReplaceAll(name, "%2C", ",")
-	return strings.TrimSpace(name)
+
+	// Strip the extension using gameExtensions - the same map scanDir uses to
+	// decide a file IS a game - rather than a second hardcoded list. That
+	// duplicate list was a real bug: it omitted .smc, .gb, .gbc, .cue, .cdi and
+	// more, so thousands of ROMs kept ".smc" in their stored title and matched
+	// nothing upstream (verified live: "EARTH BOUND.smc" resolves to nothing).
+	// Deriving it from one map means a newly supported format cannot be
+	// scannable but unstrippable again.
+	if ext := strings.ToLower(filepath.Ext(name)); ext != "" {
+		if gameExtensions[ext] || archiveExtensions[ext] {
+			name = name[:len(name)-len(ext)]
+			// ".tar.gz" leaves a trailing ".tar" behind.
+			if ext2 := strings.ToLower(filepath.Ext(name)); archiveExtensions[ext2] {
+				name = name[:len(name)-len(ext2)]
+			}
+		}
+	}
+
+	return strings.TrimSpace(stripROMTags(name))
+}
+
+// stripROMTags removes the trailing "(E)", "(USA)", "(Rev 1)", "[!]" style
+// annotations that ROM sets append.
+//
+// These are meaningless to metadata providers and actively prevent a match -
+// verified live against IGDB: "Donkey Kong Country 2 (E)" returns nothing while
+// "Donkey Kong Country 2" resolves correctly. Only *trailing* groups are
+// removed, and never the whole title, so a name that is nothing but a
+// parenthesised group survives rather than becoming empty.
+func stripROMTags(name string) string {
+	for {
+		trimmed := strings.TrimSpace(name)
+		if len(trimmed) == 0 {
+			return name
+		}
+		var open byte
+		switch trimmed[len(trimmed)-1] {
+		case ')':
+			open = '('
+		case ']':
+			open = '['
+		default:
+			return trimmed
+		}
+		idx := strings.LastIndexByte(trimmed, open)
+		// No opener, or the group is the entire title - leave it alone rather
+		// than returning an empty string.
+		if idx <= 0 {
+			return trimmed
+		}
+		name = trimmed[:idx]
+	}
 }
 
 func platformNameFromSlug(slug string) string {
