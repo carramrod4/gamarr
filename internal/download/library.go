@@ -21,8 +21,14 @@ func (m *Manager) ScanLibraryDirs() {
 	// Keyed by file path, which survives the delete/re-insert cycle.
 	// Opened here rather than at construction: the database is a 42 MB
 	// download on first use, and only a scan needs it.
-	if m.hashDB == nil && m.cfg.GamesRomsPath != "" {
-		m.hashDB = metadata.NewHashDB(filepath.Dir(m.cfg.GamesRomsPath))
+	//
+	// DataDir, emphatically not the ROM path's parent. Deriving it from the
+	// ROM path put the download in /data/Games - the Plex media share, mounted
+	// from the NAS - which is both the wrong volume and a directory this
+	// service has no business writing to. Caught by a smoke test logging where
+	// it landed; it would never have been noticed in code review.
+	if m.hashDB == nil && m.cfg.DataDir != "" {
+		m.hashDB = metadata.NewHashDB(m.cfg.DataDir)
 	}
 
 	savedMetadata := m.jobs.ScanMetadataByPath()
