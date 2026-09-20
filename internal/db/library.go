@@ -26,6 +26,23 @@ type LibraryItem struct {
 	// default to monitored (see AddLibraryItem).
 	Monitored bool   `json:"monitored"`
 	AddedAt   string `json:"added_at"`
+	// RomMD5 is the MD5 of the file's own contents, when it was worth hashing
+	// (see maxHashableSize). Empty means "not hashed", which is different from
+	// "hashed and unknown" - the latter has a hash but no CanonicalTitle.
+	RomMD5 string `json:"rom_md5"`
+	// CanonicalTitle is the release name a hash lookup returned. When set it is
+	// authoritative and Title is only what the filename happened to say.
+	CanonicalTitle string `json:"canonical_title"`
+}
+
+// NeedsAttention reports a file that was hashed and not recognised.
+//
+// Worth surfacing rather than silently leaving unmatched: an unrecognised dump
+// is usually a ROM hack, homebrew, a translation or a bad dump. Advisory only -
+// it also catches anything newer than the hash database, so it is a "look at
+// these" list, never a delete queue.
+func (i *LibraryItem) NeedsAttention() bool {
+	return i.RomMD5 != "" && i.CanonicalTitle == ""
 }
 
 // WishlistItem represents a game on the wishlist.
@@ -62,7 +79,8 @@ type LibraryPage struct {
 // what makes adding a column (like monitored) a single edit instead of seven
 // that must agree with each other and with every Scan call.
 const libraryColumns = "id, title, platform, platform_slug, is_pc, file_path, " +
-	"file_size, source, source_type, source_id, metadata, monitored, added_at"
+	"file_size, source, source_type, source_id, metadata, monitored, added_at, " +
+	"rom_md5, canonical_title"
 
 // rowScanner is satisfied by both *sql.Row and *sql.Rows.
 type rowScanner interface {
@@ -75,7 +93,8 @@ func scanLibraryItem(sc rowScanner) (LibraryItem, error) {
 	var isPC, monitored int
 	err := sc.Scan(&item.ID, &item.Title, &item.Platform, &item.PlatformSlug,
 		&isPC, &item.FilePath, &item.FileSize, &item.Source, &item.SourceType,
-		&item.SourceID, &item.Metadata, &monitored, &item.AddedAt)
+		&item.SourceID, &item.Metadata, &monitored, &item.AddedAt,
+		&item.RomMD5, &item.CanonicalTitle)
 	if err != nil {
 		return LibraryItem{}, err
 	}
@@ -142,6 +161,9 @@ func (s *JobStore) migrateExtra() {
 	// "duplicate column name" failure here is the normal steady state. Same
 	// idiom as migrateUsers' TOTP columns.
 	s.db.Exec("ALTER TABLE library_items ADD COLUMN monitored INTEGER NOT NULL DEFAULT 1")
+	s.db.Exec("ALTER TABLE library_items ADD COLUMN rom_md5 TEXT NOT NULL DEFAULT ''")
+	s.db.Exec("ALTER TABLE library_items ADD COLUMN canonical_title TEXT NOT NULL DEFAULT ''")
+	s.db.Exec("CREATE INDEX IF NOT EXISTS idx_library_rom_md5 ON library_items(rom_md5)")
 }
 
 // DB returns the underlying sql.DB for direct use.
@@ -158,10 +180,11 @@ func (s *JobStore) DB() *sql.DB {
 // that want it off flip it afterwards with SetLibraryItemMonitored.
 func (s *JobStore) AddLibraryItem(item *LibraryItem) (int64, error) {
 	result, err := s.db.Exec(
-		`INSERT INTO library_items (title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		`INSERT INTO library_items (title, platform, platform_slug, is_pc, file_path, file_size, source, source_type, source_id, metadata, rom_md5, canonical_title)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
 		item.Title, item.Platform, item.PlatformSlug, boolToInt(item.IsPC),
 		item.FilePath, item.FileSize, item.Source, item.SourceType, item.SourceID, item.Metadata,
+		item.RomMD5, item.CanonicalTitle,
 	)
 	if err != nil {
 		return 0, err

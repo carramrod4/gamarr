@@ -1,6 +1,7 @@
 package download
 
 import (
+	"gamarr/internal/metadata"
 	"log/slog"
 	"os"
 	"path/filepath"
@@ -18,6 +19,12 @@ func (m *Manager) ScanLibraryDirs() {
 	// without carrying it across, every restart silently discarded all
 	// enriched metadata and it had to be fetched from the providers again.
 	// Keyed by file path, which survives the delete/re-insert cycle.
+	// Opened here rather than at construction: the database is a 42 MB
+	// download on first use, and only a scan needs it.
+	if m.hashDB == nil && m.cfg.GamesRomsPath != "" {
+		m.hashDB = metadata.NewHashDB(filepath.Dir(m.cfg.GamesRomsPath))
+	}
+
 	savedMetadata := m.jobs.ScanMetadataByPath()
 
 	// Clear previous scan entries so we always reflect current disk state
@@ -183,7 +190,10 @@ func (m *Manager) addLibraryEntry(fp, name, platform, platformSlug string, isPC 
 
 	var fileSize int64
 	info, err := os.Stat(fp)
-	if err == nil {
+	if err != nil {
+		info = nil
+	}
+	if info != nil {
 		if info.IsDir() {
 			fileSize = dirSize(fp)
 		} else {
@@ -192,17 +202,36 @@ func (m *Manager) addLibraryEntry(fp, name, platform, platformSlug string, isPC 
 	}
 
 	title := cleanTitle(name)
+
+	// Identify by contents first. A hash is exact, so when it answers, the
+	// filename stops mattering - which is the whole point, since every
+	// metadata miss this scanner has produced was a filename problem. The
+	// cleaned-up title stays as the fallback for archives, oversized files and
+	// dumps the database does not know.
+	var romMD5, canonical string
+	if !isPC && info != nil && !info.IsDir() {
+		romMD5 = hashFileMD5(fp, fileSize)
+		if romMD5 != "" && m.hashDB != nil {
+			if match, ok := m.hashDB.LookupMD5(romMD5); ok {
+				canonical = match.Title
+				title = match.Title
+			}
+		}
+	}
+
 	id, err := m.jobs.AddLibraryItem(&db.LibraryItem{
-		Title:        title,
-		Platform:     platform,
-		PlatformSlug: platformSlug,
-		IsPC:         isPC,
-		FilePath:     fp,
-		FileSize:     fileSize,
-		Source:       "scan",
-		SourceType:   "scan",
-		SourceID:     sourceID,
-		Metadata:     "{}",
+		Title:          title,
+		Platform:       platform,
+		PlatformSlug:   platformSlug,
+		IsPC:           isPC,
+		FilePath:       fp,
+		FileSize:       fileSize,
+		Source:         "scan",
+		SourceType:     "scan",
+		SourceID:       sourceID,
+		Metadata:       "{}",
+		RomMD5:         romMD5,
+		CanonicalTitle: canonical,
 	})
 	if err != nil {
 		return 0

@@ -8,6 +8,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"gamarr/internal/metadata"
 	"io"
 	"log/slog"
 	"net/http"
@@ -41,6 +42,9 @@ type NotifyCallback func(userID, notifType, title, message string)
 
 // Manager handles download orchestration.
 type Manager struct {
+	// hashDB identifies dumps by content. Nil when unavailable, in which case
+	// the scanner falls back to title matching exactly as it did before.
+	hashDB       *metadata.HashDB
 	cfg          *config.Config
 	jobs         *db.JobStore
 	qb           *qbit.Client
@@ -80,6 +84,10 @@ type Manager struct {
 // New creates a new download Manager.
 func New(cfg *config.Config, jobs *db.JobStore, qb *qbit.Client) *Manager {
 	mgr := &Manager{cfg: cfg, jobs: jobs, qb: qb}
+
+	// Content-based identification. Opened lazily on the first scan rather
+	// than here: it downloads 42 MB on first use, and an install that never
+	// scans a ROM directory should never pay that.
 
 	// Initialize optional download clients.
 	if cfg.HasTransmission() {
