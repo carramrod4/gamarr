@@ -216,11 +216,21 @@ func (m *Manager) addLibraryEntry(fp, name, platform, platformSlug string, isPC 
 	// dumps the database does not know.
 	var romMD5, canonical string
 	if !isPC && info != nil && !info.IsDir() {
-		romMD5 = hashFileMD5(fp, fileSize)
-		if romMD5 != "" && m.hashDB != nil {
-			if match, ok := m.hashDB.LookupMD5(romMD5); ok {
-				canonical = match.Title
-				title = match.Title
+		// Every plausible header offset, tried in order: the database's hash
+		// may be of the ROM with its header stripped, and which applies is not
+		// knowable without asking.
+		variants := hashFileMD5Variants(fp, fileSize)
+		if len(variants) > 0 {
+			romMD5 = variants[0]
+			if m.hashDB != nil {
+				for _, candidate := range variants {
+					if match, ok := m.hashDB.LookupMD5(candidate); ok {
+						canonical = match.Title
+						title = match.Title
+						romMD5 = candidate
+						break
+					}
+				}
 			}
 		}
 	}
