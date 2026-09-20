@@ -82,6 +82,15 @@ func (m *Manager) scanVault(dir string) int {
 const minROMFileSize = 16 * 1024
 
 // gameExtensions are file extensions that represent playable games/ROMs.
+// gameExtensions decides what counts as a game, and is load-bearing twice: a
+// file whose extension is absent here is never scanned at all, and cleanTitle
+// derives its own strip list from this map so a title cannot keep an extension
+// the scanner accepted.
+//
+// It had no Sega formats whatsoever - a .md, .gen, .smd, .sms or .gg file was
+// silently skipped, the same way the old 1 MB size floor hid every NES
+// cartridge. Found by a test that asserted the major consoles were covered
+// rather than by anybody noticing the games were missing.
 var gameExtensions = map[string]bool{
 	".nsp": true, ".xci": true, ".nsz": true, // Switch
 	".nes": true, ".sfc": true, ".smc": true, // NES/SNES
@@ -93,6 +102,13 @@ var gameExtensions = map[string]bool{
 	".gcz": true, ".gcm": true, ".rvz": true, // GameCube
 	".wbfs": true, ".wad": true, // Wii
 	".pbp": true, ".cso": true, // PSP
+	".md": true, ".gen": true, ".smd": true, ".32x": true, // Genesis / Mega Drive
+	".sms": true, ".gg": true, ".sg": true, // Master System / Game Gear / SG-1000
+	".a26": true, ".a78": true, ".lnx": true, // Atari 2600 / 7800 / Lynx
+	".int": true, ".col": true, ".vec": true, // Intellivision / ColecoVision / Vectrex
+	".pce": true, ".sgx": true, // PC Engine / SuperGrafx
+	".ws": true, ".wsc": true, ".ngp": true, ".ngc": true, // WonderSwan / Neo Geo Pocket
+	".vb": true, ".fds": true, // Virtual Boy / Famicom Disk System
 	".zip": true, ".7z": true, ".rar": true, // Archives (common for ROMs)
 	".exe": true, ".msi": true, // PC
 }
@@ -205,6 +221,16 @@ func (m *Manager) addLibraryEntry(fp, name, platform, platformSlug string, isPC 
 }
 
 // containsGameFiles checks if a directory directly contains game ROM files.
+// containsGameFiles reports whether a directory holds a real game file.
+//
+// The size floor matters as much as the extension here, and it was missing:
+// a directory was treated as a game folder on extension alone, so one holding
+// nothing but a stub or a truncated download counted. That stayed invisible
+// until .md was added for Mega Drive - an extension Markdown also uses - and a
+// folder containing only a notes.md was indexed as a game. The ambiguity is
+// real and unavoidable (No-Intro genuinely names Mega Drive dumps .md), so the
+// discriminator has to be size: a cartridge dump is megabytes, a notes file is
+// not.
 func containsGameFiles(dir string) bool {
 	entries, err := os.ReadDir(dir)
 	if err != nil {
@@ -215,9 +241,14 @@ func containsGameFiles(dir string) bool {
 			continue
 		}
 		ext := strings.ToLower(filepath.Ext(e.Name()))
-		if gameExtensions[ext] {
-			return true
+		if !gameExtensions[ext] {
+			continue
 		}
+		info, err := e.Info()
+		if err != nil || info.Size() < minROMFileSize {
+			continue
+		}
+		return true
 	}
 	return false
 }

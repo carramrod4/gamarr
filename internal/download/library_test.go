@@ -149,10 +149,22 @@ func TestContainsGameFiles(t *testing.T) {
 			name: "direct rom file",
 			setup: func(t *testing.T) string {
 				dir := t.TempDir()
-				writeFileT(t, filepath.Join(dir, "game.nds"), []byte("rom"))
+				// A realistic size, not three bytes: containsGameFiles applies
+				// the ROM size floor, because extension alone cannot tell a
+				// Mega Drive dump from a notes.md.
+				writeFileT(t, filepath.Join(dir, "game.nds"), bigROM())
 				return dir
 			},
 			want: true,
+		},
+		{
+			name: "game extension but stub-sized",
+			setup: func(t *testing.T) string {
+				dir := t.TempDir()
+				writeFileT(t, filepath.Join(dir, "notes.md"), []byte("not a Mega Drive rom"))
+				return dir
+			},
+			want: false,
 		},
 		{
 			name: "only non-game files",
