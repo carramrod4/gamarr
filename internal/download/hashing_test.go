@@ -1,6 +1,7 @@
 package download
 
 import (
+	"archive/zip"
 	"crypto/md5"
 	"encoding/hex"
 	"os"
@@ -90,5 +91,88 @@ func TestHashVariantsSkipsArchivesAndOversizedFiles(t *testing.T) {
 	}
 	if v := hashFileMD5Variants(zip, maxHashableSize+1); v != nil {
 		t.Error("an oversized file was hashed")
+	}
+}
+
+// TestHashZipEntryMatchesTheBareROM is the property that makes archive hashing
+// worth doing at all: a ROM inside a zip must produce the same hashes as the
+// same ROM on disk, or it would never match a database keyed on the dump.
+func TestHashZipEntryMatchesTheBareROM(t *testing.T) {
+	body := make([]byte, 40*1024)
+	for i := range body {
+		body[i] = byte(i % 251)
+	}
+	header := append([]byte("NES\x1a"), make([]byte, 12)...)
+	rom := append(header, body...)
+
+	dir := t.TempDir()
+	bare := filepath.Join(dir, "Game.nes")
+	if err := os.WriteFile(bare, rom, 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	archive := filepath.Join(dir, "Game.zip")
+	zf, err := os.Create(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	zw := zip.NewWriter(zf)
+	// A sidecar alongside the dump, which real ROM sets routinely include.
+	notes, _ := zw.Create("readme.txt")
+	notes.Write([]byte("scan notes"))
+	w, err := zw.Create("Game.nes")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := w.Write(rom); err != nil {
+		t.Fatal(err)
+	}
+	zw.Close()
+	zf.Close()
+
+	info, _ := os.Stat(archive)
+	fromZip := hashZipEntryVariants(archive, info.Size())
+	fromDisk := hashFileMD5Variants(bare, int64(len(rom)))
+
+	if len(fromZip) == 0 {
+		t.Fatal("no hashes produced from the archive")
+	}
+	if len(fromZip) != len(fromDisk) {
+		t.Fatalf("archive produced %d variants, bare file %d", len(fromZip), len(fromDisk))
+	}
+	for i := range fromDisk {
+		if fromZip[i] != fromDisk[i] {
+			t.Errorf("variant %d differs: zip %s, bare %s", i, fromZip[i], fromDisk[i])
+		}
+	}
+}
+
+// TestPickROMEntryPrefersTheDumpOverASidecar pins the selection rule: the
+// largest entry is not reliably the right one when a scan sheet is bundled in.
+func TestPickROMEntryPrefersTheDumpOverASidecar(t *testing.T) {
+	dir := t.TempDir()
+	archive := filepath.Join(dir, "Game.zip")
+	zf, _ := os.Create(archive)
+	zw := zip.NewWriter(zf)
+	// The sidecar is deliberately the larger entry.
+	big, _ := zw.Create("manual scan.txt")
+	big.Write(make([]byte, 80*1024))
+	small, _ := zw.Create("Game.nes")
+	small.Write(make([]byte, 40*1024))
+	zw.Close()
+	zf.Close()
+
+	zr, err := zip.OpenReader(archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer zr.Close()
+	entry := pickROMEntry(zr.File)
+	if entry == nil || entry.Name != "Game.nes" {
+		got := "<nil>"
+		if entry != nil {
+			got = entry.Name
+		}
+		t.Errorf("picked %s, want Game.nes: a game extension outranks a bigger sidecar", got)
 	}
 }

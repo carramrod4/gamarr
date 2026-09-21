@@ -220,6 +220,11 @@ func (m *Manager) addLibraryEntry(fp, name, platform, platformSlug string, isPC 
 		// may be of the ROM with its header stripped, and which applies is not
 		// knowable without asking.
 		variants := hashFileMD5Variants(fp, fileSize)
+		if len(variants) == 0 {
+			// A zip holds the dump rather than being one, so the entry inside
+			// is hashed instead. This is where most of the library lives.
+			variants = hashZipEntryVariants(fp, fileSize)
+		}
 		if len(variants) > 0 {
 			romMD5 = variants[0]
 			if m.hashDB != nil {

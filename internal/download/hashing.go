@@ -1,11 +1,13 @@
 package download
 
 import (
+	"archive/zip"
 	"crypto/md5"
 	"encoding/hex"
 	"hash"
 	"io"
 	"os"
+	"path/filepath"
 	"strings"
 )
 
@@ -46,6 +48,24 @@ var containerExtensions = map[string]bool{
 // implies one, since a 512-byte offset into a headerless ROM is just noise.
 var headerOffsets = []int64{0, 16, 512}
 
+// plausibleOffsets narrows the header offsets worth trying for a given size.
+func plausibleOffsets(size int64) []int64 {
+	offsets := make([]int64, 0, len(headerOffsets))
+	for _, off := range headerOffsets {
+		if off >= size {
+			continue
+		}
+		// A 512-byte copier header shows up as a ROM whose size is a whole
+		// number of KB plus 512. Trying it on anything else only wastes a
+		// lookup on a hash that cannot be in the database.
+		if off == 512 && size%1024 != 512 {
+			continue
+		}
+		offsets = append(offsets, off)
+	}
+	return offsets
+}
+
 // hashFileMD5Variants returns the MD5 of the file's contents at each plausible
 // header offset, in preference order, all from a single read.
 //
@@ -63,32 +83,26 @@ func hashFileMD5Variants(path string, size int64) []string {
 		}
 	}
 
-	offsets := make([]int64, 0, len(headerOffsets))
-	for _, off := range headerOffsets {
-		if off >= size {
-			continue
-		}
-		// A 512-byte copier header shows up as a ROM whose size is a whole
-		// number of KB plus 512. Trying it on anything else only wastes a
-		// lookup on a hash that cannot be in the database.
-		if off == 512 && size%1024 != 512 {
-			continue
-		}
-		offsets = append(offsets, off)
-	}
-	if len(offsets) == 0 {
-		return nil
-	}
-
 	f, err := os.Open(path)
 	if err != nil {
 		return nil
 	}
 	defer f.Close()
+	return hashStreamVariants(f, size)
+}
 
-	// One pass over the file feeding every hasher, each ignoring its own
-	// leading bytes. Reading the file once per offset would triple the cost of
-	// the slowest part of a scan.
+// hashStreamVariants hashes one stream at every plausible header offset, in a
+// single pass. Split out so a file on disk and an entry inside an archive go
+// through identical logic rather than two copies that can drift.
+func hashStreamVariants(r io.Reader, size int64) []string {
+	offsets := plausibleOffsets(size)
+	if len(offsets) == 0 {
+		return nil
+	}
+
+	// One pass feeding every hasher, each ignoring its own leading bytes.
+	// Reading the source once per offset would triple the cost of the slowest
+	// part of a scan.
 	hashers := make([]hash.Hash, len(offsets))
 	for i := range offsets {
 		hashers[i] = md5.New()
@@ -97,7 +111,7 @@ func hashFileMD5Variants(path string, size int64) []string {
 	buf := make([]byte, 1<<20)
 	var consumed int64
 	for {
-		n, err := f.Read(buf)
+		n, err := r.Read(buf)
 		if n > 0 {
 			chunk := buf[:n]
 			for i, off := range offsets {
@@ -133,4 +147,73 @@ func hashFileMD5(path string, size int64) string {
 		return ""
 	}
 	return variants[0]
+}
+
+// hashZipEntryVariants identifies a ROM stored inside a zip.
+//
+// This is where most of the library lives: 3,646 of the 4,444 unhashed items
+// were .zip, and those are disproportionately the files whose names are worst -
+// exactly the ones title matching fails on. Hashing the container is useless
+// (OpenVGDB records the hash of the dump inside), so the entry is decompressed
+// through the hashers instead.
+//
+// Nothing is written to disk. The entry is streamed straight into the same
+// multi-offset hashers used for a bare file, so the cost is decompression and
+// nothing else.
+//
+// Zip only, deliberately. Go's standard library covers it with no new
+// dependency, while .rar and .7z together account for 351 files and would each
+// need a third-party decoder - not a trade worth making for under a tenth of
+// the remainder.
+func hashZipEntryVariants(path string, size int64) []string {
+	if size <= 0 || !strings.HasSuffix(strings.ToLower(path), ".zip") {
+		return nil
+	}
+	zr, err := zip.OpenReader(path)
+	if err != nil {
+		return nil
+	}
+	defer zr.Close()
+
+	entry := pickROMEntry(zr.File)
+	if entry == nil {
+		return nil
+	}
+	uncompressed := int64(entry.UncompressedSize64)
+	if uncompressed <= 0 || uncompressed > maxHashableSize {
+		return nil
+	}
+
+	rc, err := entry.Open()
+	if err != nil {
+		return nil
+	}
+	defer rc.Close()
+	return hashStreamVariants(rc, uncompressed)
+}
+
+// pickROMEntry chooses the dump inside an archive.
+//
+// Preference, then size: a ROM set commonly zips the dump alongside a text
+// file or a cue sheet, and the largest entry is not reliably the right one
+// when a scan sheet or manual scan is bundled in.
+func pickROMEntry(files []*zip.File) *zip.File {
+	var best *zip.File
+	var bestPreferred bool
+	for _, f := range files {
+		if f.FileInfo().IsDir() || strings.HasPrefix(f.Name, "__MACOSX") {
+			continue
+		}
+		ext := strings.ToLower(filepath.Ext(f.Name))
+		preferred := gameExtensions[ext] && !containerExtensions[ext]
+		switch {
+		case best == nil:
+			best, bestPreferred = f, preferred
+		case preferred && !bestPreferred:
+			best, bestPreferred = f, true
+		case preferred == bestPreferred && f.UncompressedSize64 > best.UncompressedSize64:
+			best = f
+		}
+	}
+	return best
 }
