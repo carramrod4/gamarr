@@ -194,6 +194,15 @@ func (s *JobStore) AddLibraryItem(item *LibraryItem) (int64, error) {
 
 // GetLibraryPage returns a paginated library.
 func (s *JobStore) GetLibraryPage(page, pageSize int, query, platformSlug string) LibraryPage {
+	return s.GetLibraryPageFiltered(page, pageSize, query, platformSlug, LibraryFilterAll)
+}
+
+// GetLibraryPageFiltered is GetLibraryPage with an identification filter.
+//
+// Filtering in SQL rather than in the handler: the page is the unit of
+// pagination, so filtering after the query would return short pages and a
+// total that does not match what came back.
+func (s *JobStore) GetLibraryPageFiltered(page, pageSize int, query, platformSlug string, filter LibraryFilter) LibraryPage {
 	if page < 1 {
 		page = 1
 	}
@@ -201,7 +210,7 @@ func (s *JobStore) GetLibraryPage(page, pageSize int, query, platformSlug string
 		pageSize = 50
 	}
 
-	where, args := buildLibraryWhere(query, platformSlug)
+	where, args := buildLibraryWhere(query, platformSlug, filter)
 
 	var total int
 	row := s.db.QueryRow("SELECT COUNT(*) FROM library_items "+where, args...)
@@ -341,9 +350,35 @@ func (s *JobStore) ScanLibraryDir(dir, platform, platformSlug string, isPC bool)
 	return 0
 }
 
-func buildLibraryWhere(query, platformSlug string) (string, []interface{}) {
+// LibraryFilter narrows a library page beyond the text and platform filters.
+type LibraryFilter string
+
+const (
+	// LibraryFilterAll is every item.
+	LibraryFilterAll LibraryFilter = ""
+	// LibraryFilterNeedsAttention is the set that was hashed and not
+	// recognised: usually a ROM hack, homebrew, a translation or a bad dump,
+	// and also anything newer than the hash database. Advisory - a list to
+	// look at, never a delete queue.
+	LibraryFilterNeedsAttention LibraryFilter = "needs_attention"
+	// LibraryFilterIdentified is the set a content hash resolved outright.
+	LibraryFilterIdentified LibraryFilter = "identified"
+	// LibraryFilterUnhashed is what could not be hashed at all - archives in
+	// formats without a decoder, and files over the size cap.
+	LibraryFilterUnhashed LibraryFilter = "unhashed"
+)
+
+func buildLibraryWhere(query, platformSlug string, filter LibraryFilter) (string, []interface{}) {
 	var conditions []string
 	var args []interface{}
+	switch filter {
+	case LibraryFilterNeedsAttention:
+		conditions = append(conditions, "rom_md5 <> '' AND canonical_title = ''")
+	case LibraryFilterIdentified:
+		conditions = append(conditions, "canonical_title <> ''")
+	case LibraryFilterUnhashed:
+		conditions = append(conditions, "rom_md5 = ''")
+	}
 	if query != "" {
 		conditions = append(conditions, "title LIKE ?")
 		args = append(args, "%"+query+"%")

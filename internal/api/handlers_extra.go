@@ -30,7 +30,20 @@ func (s *Server) handleLibrary(w http.ResponseWriter, r *http.Request) {
 	platformSlug := r.URL.Query().Get("platform")
 	tagFilter := r.URL.Query().Get("tag")
 
-	result := s.mgr.Jobs().GetLibraryPage(page, pageSize, query, platformSlug)
+	// `filter` narrows by how well the item was identified. Validated against
+	// the known values rather than passed through, so an unrecognised one
+	// returns the whole library instead of silently matching nothing.
+	var filter db.LibraryFilter
+	switch db.LibraryFilter(r.URL.Query().Get("filter")) {
+	case db.LibraryFilterNeedsAttention:
+		filter = db.LibraryFilterNeedsAttention
+	case db.LibraryFilterIdentified:
+		filter = db.LibraryFilterIdentified
+	case db.LibraryFilterUnhashed:
+		filter = db.LibraryFilterUnhashed
+	}
+
+	result := s.mgr.Jobs().GetLibraryPageFiltered(page, pageSize, query, platformSlug, filter)
 
 	// Filter by tag if specified
 	if tagFilter != "" {
