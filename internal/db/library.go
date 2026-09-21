@@ -264,6 +264,42 @@ func (s *JobStore) GetLibraryItem(id int64) (*LibraryItem, error) {
 }
 
 // UpdateLibraryItemMetadata updates the metadata JSON blob for a library item.
+// AllLibraryItems returns every row, for whole-library operations.
+//
+// Unpaged deliberately: laying the library out has to consider every item at
+// once, because two files in different pages can want the same destination and
+// only a complete view can catch that.
+func (s *JobStore) AllLibraryItems() []LibraryItem {
+	rows, err := s.db.Query("SELECT " + libraryColumns + " FROM library_items ORDER BY id")
+	if err != nil {
+		return nil
+	}
+	defer rows.Close()
+	var items []LibraryItem
+	for rows.Next() {
+		item, err := scanLibraryItem(rows)
+		if err != nil {
+			continue
+		}
+		items = append(items, item)
+	}
+	return items
+}
+
+// UpdateLibraryItemPath records where a file moved to.
+//
+// source_id follows the path as well: it is "scan:<path>", the key a scan
+// dedupes on, so leaving it behind would make the next scan treat the renamed
+// file as a new item and the old one as missing.
+func (s *JobStore) UpdateLibraryItemPath(id int64, newPath string) error {
+	_, err := s.db.Exec(
+		`UPDATE library_items SET file_path = ?,
+		 source_id = CASE WHEN source = 'scan' THEN ? ELSE source_id END
+		 WHERE id = ?`,
+		newPath, "scan:"+newPath, id)
+	return err
+}
+
 func (s *JobStore) UpdateLibraryItemMetadata(id int64, metadata string) error {
 	_, err := s.db.Exec("UPDATE library_items SET metadata = ? WHERE id = ?", metadata, id)
 	return err

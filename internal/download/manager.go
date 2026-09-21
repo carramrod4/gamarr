@@ -113,6 +113,9 @@ func New(cfg *config.Config, jobs *db.JobStore, qb *qbit.Client) *Manager {
 // Jobs returns the job store.
 func (m *Manager) Jobs() *db.JobStore { return m.jobs }
 
+// Config exposes the configuration for callers that need a path from it.
+func (m *Manager) Config() *config.Config { return m.cfg }
+
 // QB returns the qBittorrent client.
 func (m *Manager) QB() *qbit.Client { return m.qb }
 

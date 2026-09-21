@@ -35,6 +35,10 @@ func TestIsExempt(t *testing.T) {
 		// Negative cases — these MUST require auth or it's a security bug.
 		{"/api/search", false},
 		{"/api/library", false},
+		// These rename files on disk. An exempt path here would be an
+		// unauthenticated whole-library rewrite.
+		{"/api/organize/preview", false},
+		{"/api/organize/apply", false},
 		{"/api/wishlist", false},
 		{"/api/users", false},
 		{"/api/settings", false},
